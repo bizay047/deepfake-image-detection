@@ -1,61 +1,76 @@
-import streamlit as st
+import os
+import io
+import uvicorn
 import numpy as np
 import tensorflow as tf
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from PIL import Image
-import os
 
-st.set_page_config(page_title="AI Deepfake Detector", layout="centered")
+app = FastAPI()
 
-# ---------- HEADER ----------
-st.markdown(
-    """
-    <h1 style='text-align: center;'>🧠 AI Deepfake Image Detection</h1>
-    <p style='text-align: center; font-size:18px;'>
-    Upload a face image to check whether it is REAL or AI-GENERATED.
-    </p>
-    <hr>
-    """,
-    unsafe_allow_html=True
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ---------- LOAD MODEL ----------
-@st.cache_resource
-def load_model():
-    model_path = os.path.join(os.path.dirname(__file__), "deepfake_mobilenetv2_model.h5")
+# Load the model
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(BASE_DIR, 'deepfake_mobilenetv2_model.h5')
+try:
     model = tf.keras.models.load_model(model_path)
-    return model
+    print("Model loaded successfully.")
+except Exception as e:
+    print(f"Error loading model: {e}")
 
-model = load_model()
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ---------- PREPROCESS ----------
-def preprocess_image(image):
+@app.get("/")
+async def read_index():
+    return FileResponse("static/index.html")
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    # 1. Read and open (Matches Streamlit)
+    image_bytes = await file.read()
+    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    
+    # 2. Resize → Array (raw float32 – no preprocess_input needed for this model)
     image = image.resize((224, 224))
-    image = np.array(image)
-    image = np.expand_dims(image, axis=0)
-    return image
+    img_array = np.array(image, dtype=np.float32)
+    img_array = np.expand_dims(img_array, axis=0)  # Shape: (1, 224, 224, 3)
+    
+    # 3. Predict
+    prediction = model.predict(img_array)
+    score = float(prediction[0][0])
+    
+    # Debug: Watch your terminal
+    print(f"DEBUG - Raw Prediction Score: {score}")
+    
+    # ── Classification — matches the original Streamlit convention ────────────
+    # Model trained with sigmoid output:  1.0 = Real face,  0.0 = Fake / AI-generated
+    # score > 0.5  →  Real   (confidence = how high the score is, i.e. score × 100)
+    # score ≤ 0.5  →  Fake   (confidence = how far below 0.5 it is, (1 − score) × 100)
+    if score > 0.5:
+        label      = "Real"
+        confidence = round(score * 100, 1)           # e.g. 0.90 → 90 %
+    else:
+        label      = "Fake"
+        confidence = round((1.0 - score) * 100, 1)  # e.g. 0.03 → 97 %
 
-# ---------- UPLOAD ----------
-uploaded_file = st.file_uploader("📤 Upload Image", type=["jpg", "png", "jpeg"])
+    print(f"DEBUG  score={score:.4f}  →  {label}  ({confidence}%)")
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("RGB")
+    return {
+        "label":     label,
+        "confidence": confidence,
+        "raw_score":  round(score, 4)
+    }
 
-    col1, col2 = st.columns([1,1])
-
-    with col1:
-        st.image(image, caption="Uploaded Image", width=300)
-
-    processed = preprocess_image(image)
-    prediction = model.predict(processed)[0][0]
-
-    with col2:
-        st.subheader("🔍 Prediction")
-
-        if prediction > 0.5:
-            st.success("✅ REAL Image")
-            st.progress(float(prediction))
-            st.caption(f"Confidence: {prediction:.2f}")
-        else:
-            st.error("⚠️ FAKE Image")
-            st.progress(float(1 - prediction))
-            st.caption(f"Confidence: {1 - prediction:.2f}")
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
